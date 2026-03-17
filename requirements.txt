@@ -1,0 +1,5 @@
+optuna==4.7.0
+tqdm==4.67.1
+matplotlib==3.10.1
+scipy==1.14.1
+numpy==1.26.3
