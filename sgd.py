@@ -17,6 +17,7 @@ import os
 import optuna
 import mlflow
 from optuna.integration.mlflow import MLflowCallback
+from mlflow.tracking import MlflowClient
 
 
 
@@ -33,8 +34,12 @@ def runge_kutta4(f, X_n, theta, h):
     return X_n + h*(k1 + 2*k2 + 2*k3 + k4)/6
 
 
-def compute_grad(f, methode, theta_estim, A, estim_obs, n):
-    sum_term = np.dot(estim_obs[:n], A).sum(axis=0)   
+def compute_grad(f, methode, theta_estim, A, estim_obs, n, start = 5):
+    
+    if start == None:
+        sum_term = np.dot(estim_obs[:n], A).sum(axis=0)
+    else :
+        sum_term = np.dot(estim_obs[n-start:n], A).sum(axis=0)   
 
     X_nm1 = estim_obs[n-1]
     X_n   = estim_obs[n] 
@@ -137,13 +142,17 @@ def decay_grad(grads, current_grad_idx, clip_value=np.array([25,10,10]), window=
 
     return grad_estim
 
+
+
+
 def main(window = 40, 
          decay = 0.8, 
          epochs = 2,
          std = 0.01,
          noise_level = 0.5,
          lr = np.array([1e-3, 1e-3, 1e-3]), 
-         clip_value = np.array([25,10,10])): 
+         clip_value = np.array([25,10,10]),
+         start = None): 
     
     theta_estim = np.array([-5.0, -3.0, 6.0])
 
@@ -155,13 +164,19 @@ def main(window = 40,
     estim_obs = observations.copy() + noise_level*np.random.normal(0, std, (N, 3))
 
     theta_estim_vec = np.zeros((nbr_epochs, 3))
-    theta_estim_vec[0] = theta_estim
-
+    
     grads = np.zeros((nbr_epochs, 3))
 
-    for epoch in tqdm(range(1, nbr_epochs)):
+    if start ==None: 
+        beg_tqdm = 0
+    else: 
+        beg_tqdm = start
+    
+    theta_estim_vec[0:beg_tqdm] = theta_estim
+
+    for epoch in tqdm(range(beg_tqdm, nbr_epochs)):
         n = epoch % N
-        grad = compute_grad(f, runge_kutta4, theta_estim, A, estim_obs, n)
+        grad = compute_grad(f, runge_kutta4, theta_estim, A, estim_obs, n, start = start)
         grads[epoch, :] = grad
         grad = decay_grad(grads, epoch, clip_value, window, decay)
         theta_estim = sgd_update(theta_estim, grad, lr)
@@ -171,31 +186,34 @@ def main(window = 40,
     return theta_estim, theta_estim_vec, grads
 
 
-def objective(trial, noise_level, std):
+def objective(trial, noise_level, std, client):
 
     window = trial.suggest_int('window', 10, 100)  
-    # decay = trial.suggest_float('decay', 0.1, 0.99) 
-    nbr_epochs = trial.suggest_float('nbr_epochs', 0.5, 4) 
+    decay = trial.suggest_float('decay', 0.1, 0.99) 
+    nbr_epochs = trial.suggest_float('nbr_epochs', 0.5, 6) 
 
     lr = [
         trial.suggest_float('lr_0', 1e-4, 1e-3, log=True),
         trial.suggest_float('lr_1', 1e-4, 1e-3, log=True),
         trial.suggest_float('lr_2', 1e-4, 1e-3, log=True)
     ]
-    # clip_value = [
-    #     trial.suggest_int('clip_0', 1, 40),
-    #     trial.suggest_int('clip_1', 1, 30),
-    #     trial.suggest_int('clip_2', 1, 30)
-    # ]
-    with mlflow.start_run(nested=True):
+    start = trial.suggest_int("start", 1, 150)
+
+#    clip_value = [
+#         trial.suggest_int('clip_0', 1, 40),
+#         trial.suggest_int('clip_1', 1, 30),
+#         trial.suggest_int('clip_2', 1, 30)
+#     ]
+    with mlflow.start_run(nested=True) as run:
         # theta_estim, theta_estim_vec, grads = main(window, decay, nbr_epochs, noise_var, np.array(lr), np.array(clip_value))
         theta_estim, theta_estim_vec, grads = main(window = window, 
-                                                #    decay = decay, 
+                                                 decay = decay, 
                                                 epochs = nbr_epochs,
                                                 std = std,
                                                 noise_level = noise_level,
-                                                lr = lr, 
-                                                #    clip_value = np.array([25,10,10])
+                                                lr = lr,
+                                                start = start,
+                                           #     clip_value = np.array([25,10,10])
                                                 )
 
         evaluate(theta_estim, theta)
@@ -203,7 +221,7 @@ def objective(trial, noise_level, std):
         # result = np.mean((theta_estim - theta)**2)
         # result = np.mean(((theta_estim - theta)/theta)**2)*100
         eqm = ((theta_estim - theta)/theta)**2
-        result = (eqm[0]*2+eqm[1]+eqm[2])/3
+        result = (eqm[0]+eqm[1]+eqm[2])/3
 
         # result = np.var(grads)
         # result = np.mean(np.abs(grads))
@@ -229,10 +247,14 @@ def objective(trial, noise_level, std):
         mlflow.log_param("lr_0", lr[0])
         mlflow.log_param("lr_1", lr[1])
         mlflow.log_param("lr_2", lr[2])
+        mlflow.log_param("start", start)
         mlflow.log_param("std", std)
         mlflow.log_param("noise_level", noise_level)
 
         plot_estim_evolution(theta_estim_vec, theta, log_to_mlflow=True, artifact_name= f"theta_evolution_trial_{trial.number}.png")
+        # Add a description for this run
+        mlflow.set_tag("mlflow.note.content",
+                       f"Testing start = 5 and (eqm[0]+eqm[1]+eqm[2])/3")
 
 
     return result
@@ -280,11 +302,14 @@ if __name__ == "__main__":
     print(f"Noise stadard diviation is {std} and noise level {noise_level}")
     print(f"SNR (dB) for each dimension: {snr}")
     print(f"Average SNR (dB): {np.mean(snr):.2f}")
+    
+    client = MlflowClient()
+    
+    obj = lambda trial: objective(trial, noise_level=noise_level, std=std, client=client)
 
-    obj = lambda trial: objective(trial, noise_level=noise_level, std=std)
-
-    mlflow.set_experiment(f"optuna_ex{np.mean(snr):.3}")
     MLFLOW_TRACKING_URI = "http://ec2-16-171-0-26.eu-north-1.compute.amazonaws.com:5000/"
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(f"optuna_ex{np.mean(snr):.3}")
 
     mlflow_callback = MLflowCallback(
         tracking_uri=MLFLOW_TRACKING_URI,
